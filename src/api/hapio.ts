@@ -111,7 +111,15 @@ export async function getResource(id: string): Promise<Resource> {
 /** Fetch all recurring schedules for a resource */
 export async function getRecurringSchedules(resourceId: string): Promise<RecurringSchedule[]> {
   const res = await hapioFetch(`/resources/${resourceId}/recurring-schedules`);
-  return res.data || res;
+  const data = res.data || res;
+  if (Array.isArray(data)) {
+    data.forEach((s: any) => {
+      if (!s.location_id && s.location && s.location.id) {
+        s.location_id = s.location.id;
+      }
+    });
+  }
+  return data;
 }
 
 /** Fetch all services linked to a resource (with full service details) */
@@ -140,9 +148,31 @@ export async function getBookableSlots(
   serviceId: string,
   params: Record<string, string>
 ): Promise<BookableSlot[]> {
-  const query = new URLSearchParams(params).toString();
+  const queryParams = { ...params, page: '1' };
+  const query = new URLSearchParams(queryParams).toString();
   const res = await hapioFetch(`/services/${serviceId}/bookable-slots?${query}`);
-  return res.data || res;
+
+  if (!res || (!res.data && !Array.isArray(res))) {
+    return [];
+  }
+
+  const data: BookableSlot[] = res.data || (Array.isArray(res) ? res : []);
+  const meta = res.meta;
+
+  if (meta && meta.last_page > 1) {
+    const promises: Promise<BookableSlot[]>[] = [];
+    for (let p = 2; p <= meta.last_page; p++) {
+      const pageQuery = new URLSearchParams({ ...params, page: String(p) }).toString();
+      promises.push(
+        hapioFetch(`/services/${serviceId}/bookable-slots?${pageQuery}`)
+          .then(pageRes => pageRes.data || [])
+      );
+    }
+    const extraPages = await Promise.all(promises);
+    return data.concat(...extraPages);
+  }
+
+  return data;
 }
 
 /** Fetch all locations */

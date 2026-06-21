@@ -1,13 +1,14 @@
 import './style.css';
 import {
   getResource, getRecurringSchedules, getResourceServices, getService,
-  getBookableSlots, getLocation, createBooking,
+  getBookableSlots, getLocation, getLocations, createBooking,
   type BookableSlot, type Service, type RecurringSchedule,
 } from './api/hapio';
+import { lookupPatientByPhone, registerPatient } from './api/sheets';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 interface State {
-  step: 1 | 2 | 3;
+  step: 1 | 2 | 3 | 4;
   resourceId: string;
   resourceName: string;
   serviceId: string;
@@ -15,20 +16,26 @@ interface State {
   locationId: string;
   locationName: string;
   locationTimezone: string;
-  // Step 1
+  locations: { id: string; name: string; time_zone: string }[];
+  allSchedules: RecurringSchedule[];
+  // Step 2 — Patient data
+  telefono: string;
   nombre: string;
-  whatsapp: string;
   email: string;
-  motivo: string;
-  // Step 2
+  fechaNac: string;
+  // Step 2 — Lookup state
+  lookupLoading: boolean;
+  lookupDone: boolean;
+  patientFound: boolean;
+  // Step 3
   selectedDate: Date | null;
   selectedSlot: BookableSlot | null;
   calendarMonth: Date;
   slots: BookableSlot[];
   slotsLoading: boolean;
   // Disponibilidad del mes
-  availableDates: Set<string>;    // YYYY-MM-DD de días con al menos 1 slot
-  availableDatesLoaded: boolean;  // true una vez que se completó el fetch del mes
+  availableDates: Set<string>;
+  availableDatesLoaded: boolean;
   availableDatesLoading: boolean;
 }
 
@@ -41,7 +48,10 @@ const state: State = {
   locationId: '',
   locationName: '',
   locationTimezone: 'UTC',
-  nombre: '', whatsapp: '', email: '', motivo: '',
+  locations: [],
+  allSchedules: [],
+  telefono: '', nombre: '', email: '', fechaNac: '',
+  lookupLoading: false, lookupDone: false, patientFound: false,
   selectedDate: null,
   selectedSlot: null,
   calendarMonth: new Date(),
@@ -96,8 +106,8 @@ function isSameDay(a: Date, b: Date) {
 }
 
 // ── Step indicator ────────────────────────────────────────────────────────────
-function stepsHTML(current: 1 | 2 | 3) {
-  const labels = ['Datos', 'Fecha', 'Listo'];
+function stepsHTML(current: 1 | 2 | 3 | 4) {
+  const labels = ['Datos', 'Sede', 'Fecha', 'Listo'];
   return labels.map((lbl, i) => {
     const n = i + 1;
     const cls = n < current ? 'step completed' : n === current ? 'step active' : 'step';
@@ -125,54 +135,227 @@ function footerHTML() {
   return `<div class="wizard-footer">Powered by MediCita · Seguro y privado</div>`;
 }
 
-// ── STEP 1 — Patient Data ─────────────────────────────────────────────────────
+// ── STEP 1 — Phone Lookup + Patient Data ───────────────────────────────────────
 function renderStep1() {
-  const motivoOptions = ['Consulta general', 'Control de rutina', 'Revisión de resultados', 'Urgencia', 'Seguimiento', 'Otro'].map(o =>
-    `<option value="${o}" ${state.motivo === o ? 'selected' : ''}>${o}</option>`).join('');
-
   app.innerHTML = `
     <div class="wizard-card">
       ${headerHTML(false)}
       <div class="wizard-body">
-        <h1 class="step-title">¿Quién agenda la cita?</h1>
-        <p class="step-desc">Completá tus datos para continuar.</p>
+        <h1 class="step-title">Verificá tu número</h1>
+        <p class="step-desc">Ingresá tu WhatsApp para buscar tu registro.</p>
         <div id="step1-alert"></div>
         <div class="form-group">
-          <label class="form-label" for="inp-nombre">Nombre completo</label>
-          <input class="form-input" id="inp-nombre" type="text" placeholder="Ej: María García" value="${state.nombre}" autocomplete="name" />
-          <span class="form-error" id="err-nombre">Ingresá tu nombre completo.</span>
+          <label class="form-label" for="inp-telefono">WhatsApp / Teléfono</label>
+          <div class="lookup-row">
+            <input class="form-input" id="inp-telefono" type="tel"
+              placeholder="Ej: +54 9 11 1234-5678"
+              value="${state.telefono}" autocomplete="tel" />
+            <button class="btn-lookup" id="btn-buscar">Buscar</button>
+          </div>
+          <span class="form-error" id="err-telefono">Ingresá un número válido (mínimo 7 dígitos).</span>
         </div>
-        <div class="form-group">
-          <label class="form-label" for="inp-whatsapp">WhatsApp</label>
-          <input class="form-input" id="inp-whatsapp" type="tel" placeholder="Ej: +54 9 11 1234-5678" value="${state.whatsapp}" autocomplete="tel" />
-          <span class="form-error" id="err-whatsapp">Ingresá un número de WhatsApp válido.</span>
-        </div>
-        <div class="form-group">
-          <label class="form-label" for="inp-email">Email</label>
-          <input class="form-input" id="inp-email" type="email" placeholder="Ej: maria@email.com" value="${state.email}" autocomplete="email" />
-          <span class="form-error" id="err-email">Ingresá un email válido.</span>
-        </div>
-        <div class="form-group">
-          <label class="form-label" for="inp-motivo">Motivo de consulta</label>
-          <select class="form-select" id="inp-motivo">
-            <option value="">Seleccioná un motivo…</option>
-            ${motivoOptions}
-          </select>
-          <span class="form-error" id="err-motivo">Seleccioná el motivo de tu consulta.</span>
-        </div>
-        <button class="btn-primary" id="btn-next1">Siguiente →</button>
+        <div id="lookup-result"></div>
       </div>
       ${footerHTML()}
     </div>`;
 
-  document.getElementById('btn-next1')!.addEventListener('click', validateStep1);
+  document.getElementById('btn-buscar')!.addEventListener('click', doLookup);
+  document.getElementById('inp-telefono')!.addEventListener('keydown', (e) => {
+    if ((e as KeyboardEvent).key === 'Enter') doLookup();
+  });
+
+  if (state.telefono && !state.lookupDone) doLookup();
+  else if (state.lookupDone) renderLookupResult();
 }
 
-function validateStep1() {
-  const nombre = (document.getElementById('inp-nombre') as HTMLInputElement).value.trim();
-  const whatsapp = (document.getElementById('inp-whatsapp') as HTMLInputElement).value.trim();
-  const email = (document.getElementById('inp-email') as HTMLInputElement).value.trim();
-  const motivo = (document.getElementById('inp-motivo') as HTMLSelectElement).value;
+// ── STEP 2 — Location Selection ────────────────────────────────────────────────
+function renderStep2() {
+  const locationBtns = state.locations.map((loc, i) => `
+    <button class="location-option ${state.locationId === loc.id ? 'selected' : ''}"
+      id="loc-btn-${i}" data-locid="${loc.id}" data-locname="${loc.name}" data-tz="${loc.time_zone}">
+      <div class="location-option-icon">${icons.pin}</div>
+      <span class="location-option-name">${loc.name}</span>
+      <div class="location-option-check">${icons.check}</div>
+    </button>`).join('');
+
+  app.innerHTML = `
+    <div class="wizard-card">
+      ${headerHTML(true)}
+      <div class="wizard-body">
+        <h1 class="step-title">¿Dónde querés atenderte?</h1>
+        <p class="step-desc">Elegí la sede donde se realizará tu cita.</p>
+        <div id="step2-loc-alert"></div>
+        <div class="location-list">${locationBtns}</div>
+        <button class="btn-primary" id="btn-next2" ${state.locationId ? '' : 'disabled'}>Continuar →</button>
+      </div>
+      ${footerHTML()}
+    </div>`;
+
+  document.getElementById('btn-back')!.addEventListener('click', () => { state.step = 1; renderStep1(); });
+
+  state.locations.forEach((loc, i) => {
+    document.getElementById(`loc-btn-${i}`)!.addEventListener('click', () => {
+      document.querySelectorAll('.location-option').forEach(el => el.classList.remove('selected'));
+      document.getElementById(`loc-btn-${i}`)!.classList.add('selected');
+      state.locationId       = loc.id;
+      state.locationName     = loc.name;
+      state.locationTimezone = loc.time_zone || 'UTC';
+      const btn = document.getElementById('btn-next2') as HTMLButtonElement;
+      if (btn) btn.disabled = false;
+    });
+  });
+
+  document.getElementById('btn-next2')!.addEventListener('click', selectLocationAndContinue);
+}
+
+async function selectLocationAndContinue() {
+  if (!state.locationId) return;
+  const btn = document.getElementById('btn-next2') as HTMLButtonElement;
+  btn.classList.add('loading'); btn.disabled = true;
+
+  try {
+    const schedulesForLoc = state.allSchedules.filter(s => (s.location_id || (s as any).location?.id) === state.locationId);
+    const activeSchedule  = findActiveSchedule(schedulesForLoc.length ? schedulesForLoc : state.allSchedules);
+    const metaSvcIds: string[] = activeSchedule?.metadata?.services ?? [];
+
+    let services: Service[] = [];
+    if (metaSvcIds.length > 0) {
+      const fetched = await Promise.allSettled(metaSvcIds.map(id => getService(id)));
+      services = fetched
+        .filter((r): r is PromiseFulfilledResult<Service> => r.status === 'fulfilled')
+        .map(r => r.value)
+        .filter(s => s.enabled !== false);
+    }
+    if (services.length === 0) {
+      const global = await getResourceServices(state.resourceId);
+      services = global.filter((s: Service) => s.enabled !== false);
+    }
+    const svc = services.find(s => s.duration !== 'P1D') || services[0];
+    if (!svc) throw new Error('Esta sede no tiene servicios disponibles.');
+
+    state.serviceId   = svc.id;
+    state.serviceName = svc.name;
+    state.step = 3;
+    renderStep3();
+  } catch (err: any) {
+    btn.classList.remove('loading'); btn.disabled = false;
+    const alertEl = document.getElementById('step2-loc-alert');
+    if (alertEl) alertEl.innerHTML = `<div class="alert alert-error">${icons.warn} ${err.message}</div>`;
+  }
+}
+
+
+async function doLookup() {
+  const input = document.getElementById('inp-telefono') as HTMLInputElement | null;
+  const tel = (input?.value ?? state.telefono).trim();
+
+  const errEl = document.getElementById('err-telefono')!;
+  const inpEl = document.getElementById('inp-telefono') as HTMLElement | null;
+
+  if (tel.replace(/\D/g, '').length < 7) {
+    errEl.classList.add('visible');
+    inpEl?.classList.add('error');
+    return;
+  }
+  errEl.classList.remove('visible');
+  inpEl?.classList.remove('error');
+
+  state.telefono = tel;
+  state.lookupLoading = true;
+  state.lookupDone = false;
+  renderLookupResult();
+
+  try {
+    const result = await lookupPatientByPhone(tel);
+    if (result.found) {
+      state.nombre      = result.nombre;
+      state.email       = result.email;
+      state.fechaNac    = result.fecha_nac;
+      state.patientFound = true;
+    } else {
+      state.nombre = ''; state.email = ''; state.fechaNac = '';
+      state.patientFound = false;
+    }
+    state.lookupDone = true;
+  } catch (err: any) {
+    console.error('[lookup]', err);
+    const alertEl = document.getElementById('step1-alert');
+    if (alertEl) alertEl.innerHTML = `<div class="alert alert-error">${icons.warn} ${err.message || 'Error al buscar. Intenta de nuevo.'}</div>`;
+    state.lookupDone = false;
+  } finally {
+    state.lookupLoading = false;
+    renderLookupResult();
+  }
+}
+
+function renderLookupResult() {
+  const el = document.getElementById('lookup-result');
+  if (!el) return;
+
+  if (state.lookupLoading) {
+    el.innerHTML = `<div class="slots-loading"><div class="mini-spinner"></div> Buscando registro…</div>`;
+    return;
+  }
+
+  if (!state.lookupDone) { el.innerHTML = ''; return; }
+
+  if (state.patientFound) {
+    el.innerHTML = `
+      <div class="lookup-found-badge">${icons.check} Paciente encontrado</div>
+      <div class="summary-card" style="margin-top:12px">
+        <div class="summary-row">
+          <div class="summary-icon">${icons.person}</div>
+          <div class="summary-info"><div class="summary-key">Nombre</div><div class="summary-val">${state.nombre}</div></div>
+        </div>
+        ${state.email ? `<div class="summary-row">
+          <div class="summary-icon">${icons.mail}</div>
+          <div class="summary-info"><div class="summary-key">Email</div><div class="summary-val">${state.email}</div></div>
+        </div>` : ''}
+        <div class="summary-row">
+          <div class="summary-icon">${icons.cal}</div>
+          <div class="summary-info"><div class="summary-key">Fecha de nacimiento</div><div class="summary-val">${fmtBirthdate(state.fechaNac)}</div></div>
+        </div>
+      </div>
+      <button class="btn-primary" id="btn-continuar" style="margin-top:16px">Continuar →</button>
+      <button class="btn-secondary" id="btn-no-soy" style="margin-top:8px">No soy yo / Cambiar número</button>`;
+
+    document.getElementById('btn-continuar')!.addEventListener('click', () => { state.step = 2; renderStep2(); });
+    document.getElementById('btn-no-soy')!.addEventListener('click', () => {
+      state.telefono = ''; state.lookupDone = false; state.patientFound = false;
+      state.nombre = ''; state.email = ''; state.fechaNac = '';
+      renderStep1();
+    });
+
+  } else {
+    el.innerHTML = `
+      <div class="alert alert-info" style="margin-bottom:16px">${icons.warn} No encontramos tu número. Completá tus datos para registrarte.</div>
+      <div class="form-group">
+        <label class="form-label" for="inp-nombre">Nombre completo *</label>
+        <input class="form-input" id="inp-nombre" type="text"
+          placeholder="Ej: María García" value="${state.nombre}" autocomplete="name" />
+        <span class="form-error" id="err-nombre">Ingresá tu nombre completo.</span>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="inp-email">Email <span class="label-optional">(opcional)</span></label>
+        <input class="form-input" id="inp-email" type="email"
+          placeholder="Ej: maria@email.com" value="${state.email}" autocomplete="email" />
+        <span class="form-error" id="err-email">Ingresá un email válido.</span>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="inp-fechanac">Fecha de nacimiento *</label>
+        <input class="form-input" id="inp-fechanac" type="date" value="${state.fechaNac}" />
+        <span class="form-error" id="err-fechanac">Ingresá tu fecha de nacimiento.</span>
+      </div>
+      <button class="btn-primary" id="btn-registrar">Registrarme y continuar →</button>`;
+
+    document.getElementById('btn-registrar')!.addEventListener('click', validateAndRegister);
+  }
+}
+
+async function validateAndRegister() {
+  const nombre   = (document.getElementById('inp-nombre')   as HTMLInputElement).value.trim();
+  const email    = (document.getElementById('inp-email')    as HTMLInputElement).value.trim();
+  const fechaNac = (document.getElementById('inp-fechanac') as HTMLInputElement).value.trim();
 
   let valid = true;
   const setErr = (id: string, inputId: string, show: boolean) => {
@@ -180,40 +363,76 @@ function validateStep1() {
     (document.getElementById(inputId) as HTMLElement).classList.toggle('error', show);
     if (show) valid = false;
   };
+  setErr('err-nombre',   'inp-nombre',   nombre.length < 3);
+  if (email) setErr('err-email', 'inp-email', !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
+  setErr('err-fechanac', 'inp-fechanac', !fechaNac);
+  if (!valid) return;
 
-  setErr('err-nombre', 'inp-nombre', nombre.length < 3);
-  setErr('err-whatsapp', 'inp-whatsapp', whatsapp.length < 7);
-  setErr('err-email', 'inp-email', !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
-  setErr('err-motivo', 'inp-motivo', !motivo);
+  state.nombre = nombre; state.email = email; state.fechaNac = fechaNac;
 
-  if (valid) {
-    state.nombre = nombre;
-    state.whatsapp = whatsapp;
-    state.email = email;
-    state.motivo = motivo;
+  const btn = document.getElementById('btn-registrar') as HTMLButtonElement;
+  btn.classList.add('loading'); btn.disabled = true;
+
+  try {
+    await registerPatient({ telefono: state.telefono, nombre, email, fecha_nac: fechaNac });
     state.step = 2;
     renderStep2();
+  } catch (err: any) {
+    console.error('[register]', err);
+    btn.classList.remove('loading');
+    btn.disabled = false;
+    const alertEl = document.getElementById('step1-alert');
+    if (alertEl) {
+      alertEl.innerHTML = `<div class="alert alert-error">${icons.warn} No se pudo registrar: ${err.message || 'Intenta de nuevo.'}</div>`;
+    }
   }
 }
 
-// ── STEP 2 — Calendar + Slots ─────────────────────────────────────────────────
-function renderStep2() {
+/** Formatea la fecha a DD/MM/YYYY eliminando zonas horarias o formatos largos */
+function fmtBirthdate(dateStr: string): string {
+  if (!dateStr) return '';
+  const str = String(dateStr).trim();
+
+  // Si es una fecha con zona horaria o fecha larga de JS (ej: "Thu Mar 30 2006..." o contiene GMT)
+  if (str.includes('GMT') || /^[a-zA-Z]{3}\s[a-zA-Z]{3}/.test(str)) {
+    const d = new Date(str);
+    if (!isNaN(d.getTime())) {
+      const day = String(d.getDate()).padStart(2, '0');
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const year = d.getFullYear();
+      return `${day}/${month}/${year}`;
+    }
+  }
+
+  // Formato estándar YYYY-MM-DD
+  if (str.includes('-')) {
+    const [y, m, d] = str.split('-');
+    return d && m && y ? `${d.padStart(2, '0')}/${m.padStart(2, '0')}/${y}` : str;
+  }
+
+  // Formato ya formateado u otro (ej: DD/MM/YYYY)
+  return str;
+}
+
+// ── STEP 3 — Calendar + Slots ─────────────────────────────────────────────────
+
+function renderStep3() {
   app.innerHTML = `
     <div class="wizard-card">
       ${headerHTML(true)}
       <div class="wizard-body">
         <h1 class="step-title">Elegí fecha y hora</h1>
         <p class="step-desc">Seleccioná el día y horario disponible.</p>
-        <div id="step2-alert"></div>
+        <div id="step3-alert"></div>
         <div class="calendar-wrapper" id="calendar"></div>
         <div class="slots-section" id="slots-section"></div>
-        <button class="btn-primary" id="btn-next2" disabled>Siguiente →</button>
+        <button class="btn-primary" id="btn-next3" disabled>Siguiente →</button>
       </div>
       ${footerHTML()}
     </div>`;
 
-  document.getElementById('btn-back')!.addEventListener('click', () => { state.step = 1; renderStep1(); });
-  document.getElementById('btn-next2')!.addEventListener('click', () => { state.step = 3; renderStep3(); });
+  document.getElementById('btn-back')!.addEventListener('click', () => { state.step = 2; renderStep2(); });
+  document.getElementById('btn-next3')!.addEventListener('click', () => { state.step = 4; renderStep4(); });
 
   // Reset disponibilidad del mes y cargar
   state.availableDates = new Set();
@@ -459,12 +678,12 @@ function renderSlots() {
 }
 
 function updateNextBtn() {
-  const btn = document.getElementById('btn-next2') as HTMLButtonElement | null;
+  const btn = document.getElementById('btn-next3') as HTMLButtonElement | null;
   if (btn) btn.disabled = !state.selectedSlot;
 }
 
-// ── STEP 3 — Confirm & Submit ─────────────────────────────────────────────────
-function renderStep3() {
+// ── STEP 4 — Confirm & Submit ─────────────────────────────────────────────────
+function renderStep4() {
   const dateStr = state.selectedDate ? fmt(state.selectedDate) : '';
   const timeStr = state.selectedSlot ? fmtTime(state.selectedSlot.starts_at) : '';
 
@@ -475,7 +694,7 @@ function renderStep3() {
         <div class="confirm-icon">${icons.check}</div>
         <h1 class="confirm-title">Confirmá tu cita</h1>
         <p class="confirm-subtitle">Revisá los datos antes de agendar.</p>
-        <div id="step3-alert"></div>
+        <div id="step4-alert"></div>
         <div class="summary-card">
           <div class="summary-row">
             <div class="summary-icon">${icons.person}</div>
@@ -483,20 +702,12 @@ function renderStep3() {
           </div>
           <div class="summary-row">
             <div class="summary-icon">${icons.phone}</div>
-            <div class="summary-info"><div class="summary-key">WhatsApp</div><div class="summary-val">${state.whatsapp}</div></div>
+            <div class="summary-info"><div class="summary-key">WhatsApp</div><div class="summary-val">${state.telefono}</div></div>
           </div>
-          <div class="summary-row">
+          ${state.email ? `<div class="summary-row">
             <div class="summary-icon">${icons.mail}</div>
             <div class="summary-info"><div class="summary-key">Email</div><div class="summary-val">${state.email}</div></div>
-          </div>
-          <div class="summary-row">
-            <div class="summary-icon">${icons.steth}</div>
-            <div class="summary-info"><div class="summary-key">Motivo</div><div class="summary-val">${state.motivo}</div></div>
-          </div>
-          <div class="summary-row">
-            <div class="summary-icon">${icons.svc}</div>
-            <div class="summary-info"><div class="summary-key">Servicio</div><div class="summary-val">${state.serviceName}</div></div>
-          </div>
+          </div>` : ''}
           <div class="summary-row">
             <div class="summary-icon">${icons.pin}</div>
             <div class="summary-info"><div class="summary-key">Localización</div><div class="summary-val">${state.locationName}</div></div>
@@ -511,13 +722,13 @@ function renderStep3() {
           </div>
         </div>
         <button class="btn-primary" id="btn-confirm">Confirmar cita</button>
-        <button class="btn-secondary" id="btn-back3">← Modificar datos</button>
+        <button class="btn-secondary" id="btn-back4">← Modificar fecha</button>
       </div>
       ${footerHTML()}
     </div>`;
 
-  document.getElementById('btn-back')!.addEventListener('click', () => { state.step = 2; renderStep2(); });
-  document.getElementById('btn-back3')!.addEventListener('click', () => { state.step = 2; renderStep2(); });
+  document.getElementById('btn-back')!.addEventListener('click', () => { state.step = 3; renderStep3(); });
+  document.getElementById('btn-back4')!.addEventListener('click', () => { state.step = 3; renderStep3(); });
   document.getElementById('btn-confirm')!.addEventListener('click', submitBooking);
 }
 
@@ -536,9 +747,9 @@ async function submitBooking() {
       metadata: {
         customer: {
           name: state.nombre,
-          phone: state.whatsapp,
+          phone: state.telefono,
           email: state.email,
-          reason: state.motivo,
+          birthdate: state.fechaNac,
         },
       },
     });
@@ -546,7 +757,7 @@ async function submitBooking() {
   } catch (err: any) {
     btn.classList.remove('loading');
     btn.disabled = false;
-    const alertEl = document.getElementById('step3-alert')!;
+    const alertEl = document.getElementById('step4-alert')!;
     alertEl.innerHTML = `<div class="alert alert-error">${icons.warn} ${err.message || 'No se pudo confirmar la cita. Intenta de nuevo.'}</div>`;
   }
 }
@@ -578,6 +789,10 @@ function renderSuccess() {
             <div class="summary-info"><div class="summary-key">Paciente</div><div class="summary-val">${state.nombre}</div></div>
           </div>
           <div class="summary-row">
+            <div class="summary-icon">${icons.phone}</div>
+            <div class="summary-info"><div class="summary-key">WhatsApp</div><div class="summary-val">${state.telefono}</div></div>
+          </div>
+          <div class="summary-row">
             <div class="summary-icon">${icons.svc}</div>
             <div class="summary-info"><div class="summary-key">Servicio</div><div class="summary-val">${state.serviceName}</div></div>
           </div>
@@ -592,10 +807,6 @@ function renderSuccess() {
           <div class="summary-row">
             <div class="summary-icon">${icons.clock}</div>
             <div class="summary-info"><div class="summary-key">Hora</div><div class="summary-val">${timeStr}</div></div>
-          </div>
-          <div class="summary-row">
-            <div class="summary-icon">${icons.steth}</div>
-            <div class="summary-info"><div class="summary-key">Motivo</div><div class="summary-val">${state.motivo}</div></div>
           </div>
         </div>
         <button class="btn-secondary" id="btn-new">Salir</button>
@@ -623,34 +834,26 @@ function renderError(msg: string) {
 
 /**
  * Determina si un RecurringSchedule está activo en la fecha dada.
- * Compara solo fechas (YYYY-MM-DD), ignorando hora.
  */
 function isScheduleActiveOn(schedule: RecurringSchedule, date: Date): boolean {
   const pad = (n: number) => String(n).padStart(2, '0');
   const dateStr = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-
   if (dateStr < schedule.start_date) return false;
   if (schedule.end_date && dateStr > schedule.end_date) return false;
   return true;
 }
 
 /**
- * Busca el RecurringSchedule activo HOY. Si hay varios activos,
- * prioriza el que tenga metadata.services definido.
- * Si ninguno está activo hoy, devuelve el primero disponible como fallback.
+ * Busca el RecurringSchedule activo HOY para una lista de schedules.
+ * Prioriza el que tenga metadata.services. Fallback al primero futuro.
  */
 function findActiveSchedule(schedules: RecurringSchedule[]): RecurringSchedule | null {
   if (!schedules.length) return null;
-
   const today = new Date();
   const activeToday = schedules.filter(s => isScheduleActiveOn(s, today));
-
   if (activeToday.length > 0) {
-    // Preferir el que tenga servicios en metadata
     return activeToday.find(s => s.metadata?.services?.length) ?? activeToday[0];
   }
-
-  // Fallback: el primer schedule futuros, o el más reciente
   const future = schedules
     .filter(s => !s.end_date || s.end_date >= today.toISOString().substring(0, 10))
     .sort((a, b) => a.start_date.localeCompare(b.start_date));
@@ -658,91 +861,51 @@ function findActiveSchedule(schedules: RecurringSchedule[]): RecurringSchedule |
 }
 
 async function init() {
-  // Show loading
   app.innerHTML = `<div class="loading-screen"><div class="spinner"></div><span class="loading-text">Cargando…</span></div>`;
 
-  // ── Leer parámetros del URL (suministrados por el chatbot) ────────────────
   const params = new URLSearchParams(window.location.search);
   const resourceId = params.get('recurso') || params.get('resource_id') || params.get('r');
-  const locationId = params.get('localizacion') || params.get('location_id') || params.get('l');
+  const telefonoParam = params.get('telefono') || params.get('phone') || params.get('t');
+  if (telefonoParam) state.telefono = telefonoParam;
 
   if (!resourceId) {
     renderError('No se especificó un médico o recurso.<br>Accedé al formulario desde el link de tu chatbot.');
     return;
   }
 
-  if (!locationId) {
-    renderError('No se especificó una localización.<br>Accedé al formulario desde el link de tu chatbot.');
-    return;
-  }
-
   state.resourceId = resourceId;
 
   try {
-    // ── Paso A: Cargar recurso, localización y horarios en paralelo ───────────
-    // La localización viene del URL (resuelta por el chatbot), así que
-    // la fetcheamos directamente por ID — sin traer todas las localizaciones.
-    const [resource, location, schedules] = await Promise.all([
+    const [resource, allLocations, schedules] = await Promise.all([
       getResource(resourceId),
-      getLocation(locationId),
+      getLocations(),
       getRecurringSchedules(resourceId),
     ]);
 
-    state.resourceName     = resource.name;
-    state.locationId       = location.id;
-    state.locationName     = location.name;
-    state.locationTimezone = location.time_zone || 'UTC';
+    state.resourceName = resource.name;
+    state.allSchedules = schedules;
 
-    // ── Paso B: Buscar el schedule activo que corresponde a esta localización ─
-    // Filtramos primero los schedules de la localización recibida para que
-    // los servicios del turno sean coherentes con la sede indicada por el chatbot.
-    const schedulesForLocation = schedules.filter(s => s.location_id === locationId);
-    const activeSchedule = findActiveSchedule(
-      schedulesForLocation.length ? schedulesForLocation : schedules
-    );
+    // Filtrar solo las sedes donde el médico tiene turnos configurados
+    const scheduleLocIds = new Set(schedules.map((s: RecurringSchedule) => s.location_id || (s as any).location?.id).filter(Boolean));
+    state.locations = allLocations.filter((loc: { id: string }) => scheduleLocIds.has(loc.id));
 
-    // ── Paso C: Determinar servicios desde metadata del turno activo ──────────
-    let resolvedServices: Service[] = [];
-    const metadataServiceIds: string[] = activeSchedule?.metadata?.services ?? [];
+    // Fallback: si no hay schedules, mostrar todas las sedes
+    if (state.locations.length === 0) state.locations = allLocations;
 
-    if (metadataServiceIds.length > 0) {
-      console.log('[init] Usando servicios del turno activo:', metadataServiceIds);
-      const fetched = await Promise.allSettled(
-        metadataServiceIds.map(id => getService(id))
-      );
-      resolvedServices = fetched
-        .filter((r): r is PromiseFulfilledResult<Service> => r.status === 'fulfilled')
-        .map(r => r.value)
-        .filter(s => s.enabled !== false);
-    }
-
-    // Fallback: si el turno no tiene metadata.services, usar todos los del recurso
-    if (resolvedServices.length === 0) {
-      console.warn('[init] Sin metadata.services en el turno — usando servicios globales del recurso.');
-      const globalServices = await getResourceServices(resourceId);
-      resolvedServices = globalServices.filter((s: Service) => s.enabled !== false);
-    }
-
-    // ── Paso D: Seleccionar servicio ──────────────────────────────────────────
-    const svc: Service | undefined =
-      resolvedServices.find(s => s.duration !== 'P1D') ||
-      resolvedServices[0];
-
-    if (!svc) {
-      renderError('Este médico no tiene servicios disponibles. Contactá a la clínica.');
+    if (state.locations.length === 0) {
+      renderError('Este médico no tiene sedes configuradas. Contactá a la clínica.');
       return;
     }
 
-    state.serviceId   = svc.id;
-    state.serviceName = svc.name;
+    // Si solo hay una sede, pre-seleccionarla automáticamente
+    if (state.locations.length === 1) {
+      const only = state.locations[0];
+      state.locationId       = only.id;
+      state.locationName     = only.name;
+      state.locationTimezone = only.time_zone || 'UTC';
+    }
 
-    console.log('[init] Configuración del wizard:', {
-      recurso: state.resourceName,
-      servicio: state.serviceName,
-      localización: state.locationName,
-      turnoActivo: activeSchedule?.id ?? 'ninguno (fallback)',
-    });
-
+    console.log('[init] Sedes disponibles:', state.locations.map((l: { name: string }) => l.name));
     renderStep1();
   } catch (err: any) {
     renderError(err.message || 'Error inesperado. Por favor, intentá de nuevo más tarde.');
